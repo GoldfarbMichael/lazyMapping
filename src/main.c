@@ -12,13 +12,20 @@
 #define CLCOCK_SPEED 3.1e9 // 3.1 GHz
 #define MAX_NUM_GROUPS 64
 #define LINE_SIZE  64
-#define NUM_OF_GROUPS 2
+#define DEFAULT_ARENA_MB 24
 
 typedef struct {
     uint8_t **addrs;   // array of addresses in this group
     size_t    count;   // how many are used
     size_t    cap;     // capacity (for safety)
 } group_t;
+
+typedef struct {
+    const char *name;
+    int num_groups;
+    int prime_enabled;  // 1 for prime, 0 for no_prime
+} experiment_config_t;
+
 
 void prepareL3(l3pp_t *l3) {
      l3info_t l3i = (l3info_t)malloc(sizeof(struct l3info));
@@ -179,7 +186,7 @@ static inline void maccessMy(void *p) {
 int main(int argc, char **argv) {
 
       // --- params ---
-    size_t arena_mb = 12;         // default ~12 MiB
+    size_t arena_mb = DEFAULT_ARENA_MB;       
     if (argc > 1) {
         arena_mb = strtoull(argv[1], NULL, 10);
         if (arena_mb == 0) {
@@ -199,14 +206,16 @@ int main(int argc, char **argv) {
         return 1;  // Error already printed
     }
 
-    FILE *log = fopen("group_traces.jsonl", "w");
-    if (!log) {
-        fprintf(stderr, "Failed to open log file\n");
-        cleanup_groups(groups, arena);
-        l3_release(l3);
-        free(res);
-        return 1;
-    }
+    experiment_config_t experiments[] = {
+    {"1_group_no_prime0", 1, 0},
+    {"1_group_no_prime1", 1, 0},
+    {"1_group_prime", 1, 1},
+    {"2_group_prime", 2, 1},
+    {"64_group_prime", 64, 1}
+    };
+    int num_experiments = sizeof(experiments) / sizeof(experiments[0]);
+
+
 
     // // --- sanity print ---
     // for (int g = 0; g < MAX_NUM_GROUPS; g++) {
@@ -230,63 +239,76 @@ int main(int argc, char **argv) {
         }
     }
 
-    group_t *new_groups = merge_groups_create_new(groups, NUM_OF_GROUPS);  
-    if (!new_groups) {
-        printf("merge failed\n");
-    } else {
-        // Only free the old groups structure, NOT the arena
-        if (groups) {
-            for (int g = 0; g < MAX_NUM_GROUPS; g++) {
-                free(groups[g].addrs);
-            }
-            free(groups);
-        }
+    // Run each experiment
+    for (int exp = 0; exp < num_experiments; exp++) {
+        experiment_config_t *config = &experiments[exp];
         
-        groups = new_groups;
-        printf("merge success\n");
-    }
+        printf("Running experiment: %s (groups: %d, prime: %s)\n", 
+               config->name, config->num_groups, 
+               config->prime_enabled ? "yes" : "no");
 
-
-    for(int g = 0; g < NUM_OF_GROUPS; g++){
-        for(int iter = 0; iter < 30; iter++){
-            printf("Group %d, Iteration %d\n", g, iter);
-            l3_bprobecount(l3, res); // reset probe counts (traverses backwards)
-
-            // Ensure all memory accesses complete before probing
-            __asm__ volatile("mfence" ::: "memory");
-
-            // // PRIME group g
-            // for (size_t i = 0; i < groups[g].count; i++) {
-            //     maccessMy(groups[g].addrs[i]);
-            // }
-
-            // Ensure all memory accesses complete before probing
-            __asm__ volatile("mfence" ::: "memory");
-
-            l3_probecount(l3, res);
-
-            // Write to JSONL log
-            fprintf(log, "{\"group\":%d,\"iter\":%d,\"probe_counts\":[", g, iter);
-            for (int set = 0; set < l3_getSets(l3); set++) {
-                fprintf(log, "%u", res[set]);
-                if (set < l3_getSets(l3) - 1) {
-                    fprintf(log, ",");
-                }
-            }
-            fprintf(log, "]}\n");
-            fflush(log); // Ensure data is written immediately
-            sleep(1); 
+        // Create merged groups for this experiment
+        group_t *exp_groups = merge_groups_create_new(groups, config->num_groups);
+        if (!exp_groups) {
+            printf("merge failed for %s\n", config->name);
+            continue;
         }
+
+        // Create log file
+        char filename[256];
+        snprintf(filename, sizeof(filename), "%s.jsonl", config->name);
+        FILE *log = fopen(filename, "w");
+        
+        if (!log) {
+            fprintf(stderr, "Failed to open log file %s\n", filename);
+            cleanup_merged_groups(exp_groups, config->num_groups);
+            continue;
+        }
+
+        // Run the experiment
+        for(int g = 0; g < config->num_groups; g++){
+            for(int iter = 0; iter < 30; iter++){
+                printf("Group %d, Iteration %d\n", g, iter);
+                l3_bprobecount(l3, res);
+
+                __asm__ volatile("mfence" ::: "memory");
+
+                // Prime only if enabled
+                if (config->prime_enabled) {
+                    for (size_t i = 0; i < exp_groups[g].count; i++) {
+                        maccessMy(exp_groups[g].addrs[i]);
+                    }
+                }
+
+                __asm__ volatile("mfence" ::: "memory");
+                l3_probecount(l3, res);
+
+                // Write to JSONL log
+                fprintf(log, "{\"group\":%d,\"iter\":%d,\"probe_counts\":[", g, iter);
+                for (int set = 0; set < l3_getSets(l3); set++) {
+                    fprintf(log, "%u", res[set]);
+                    if (set < l3_getSets(l3) - 1) {
+                        fprintf(log, ",");
+                    }
+                }
+                fprintf(log, "]}\n");
+                fflush(log);
+                sleep(1);
+            }
+        }
+
+        fclose(log);
+        cleanup_merged_groups(exp_groups, config->num_groups);
+        printf("Completed experiment: %s\n", config->name);
     }
 
 
-    // Cleanup
-    cleanup_merged_groups(groups, NUM_OF_GROUPS);
+
 if (arena) {
     free(arena);  // Free arena separately
 }
     l3_release(l3);
     free(res);
-    fclose(log); 
+    
     return 0;
 }
