@@ -3,8 +3,21 @@
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
+#include <time.h>
 #include <mastik/impl.h>
 
+
+// Fisher-Yates shuffle algorithm
+void shuffle_array(uint8_t **array, size_t n) {
+    if (n > 1) {
+        for (size_t i = n - 1; i > 0; i--) {
+            size_t j = rand() % (i + 1);
+            uint8_t *temp = array[i];
+            array[i] = array[j];
+            array[j] = temp;
+        }
+    }
+}
 
 
 void prepareL3(l3pp_t *l3) {
@@ -30,19 +43,20 @@ group_t* initialize_groups(size_t arena_mb, void **arena_ptr, size_t *num_pages_
     const size_t MB = 1024 * 1024;
     size_t arena_size = arena_mb * MB;
 
-    // align arena on PAGE_SIZE
+    // Seed random number generator
+    srand(time(42));
+
     void *arena = NULL;
     if (posix_memalign(&arena, PAGE_SIZE, arena_size) != 0) {
         perror("posix_memalign");
         return NULL;
     }
-    memset(arena, 0, arena_size); // initialize to zero
+    memset(arena, 0, arena_size);
 
     size_t num_pages = arena_size / PAGE_SIZE;
     printf("Arena: %zu MiB, pages: %zu, groups: %d\n",
            arena_mb, num_pages, MAX_NUM_GROUPS);
 
-    // --- init groups ---
     group_t *groups = malloc(MAX_NUM_GROUPS * sizeof(group_t));
     if (!groups) {
         fprintf(stderr, "malloc failed for groups array\n");
@@ -50,86 +64,111 @@ group_t* initialize_groups(size_t arena_mb, void **arena_ptr, size_t *num_pages_
         return NULL;
     }
 
+    // Initialize each group's linked list
     for (int g = 0; g < MAX_NUM_GROUPS; g++) {
-        groups[g].cap   = num_pages;   // one addr per page
+        groups[g].head = NULL;
+        groups[g].tail = NULL;
         groups[g].count = 0;
-        groups[g].addrs = malloc(num_pages * sizeof(uint8_t *));
-        if (!groups[g].addrs) {
-            fprintf(stderr, "malloc failed for group %d\n", g);
-            // Cleanup previously allocated groups
-            for (int cleanup = 0; cleanup < g; cleanup++) {
-                free(groups[cleanup].addrs);
-            }
-            free(groups);
-            free(arena);
-            return NULL;
-        }
     }
 
-    // --- build lazy groups ---
+    // Build groups with linked lists
     for (size_t p = 0; p < num_pages; p++) {
         uint8_t *page_base = (uint8_t *)arena + p * PAGE_SIZE;
         for (int g = 0; g < MAX_NUM_GROUPS; g++) {
-            size_t off = (size_t)g * LINE_SIZE;  // g[0..63] - jumps of 64 bytes
+            size_t off = (size_t)g * LINE_SIZE;
             uint8_t *addr = page_base + off;
-            groups[g].addrs[groups[g].count++] = addr;
+            
+            // Create new node
+            addr_node_t *new_node = malloc(sizeof(addr_node_t));
+            if (!new_node) {
+                fprintf(stderr, "malloc failed for node in group %d\n", g);
+                cleanup_groups(groups, arena);
+                return NULL;
+            }
+            
+            new_node->addr = addr;
+            new_node->next = NULL;
+            
+            // Add to linked list (append to tail)
+            if (groups[g].head == NULL) {
+                groups[g].head = new_node;
+                groups[g].tail = new_node;
+            } else {
+                groups[g].tail->next = new_node;
+                groups[g].tail = new_node;
+            }
+            groups[g].count++;
         }
     }
 
-    // Return values through pointers
+    // Randomize each group's linked list
+    printf("Randomizing group lists...\n");
+    for (int g = 0; g < MAX_NUM_GROUPS; g++) {
+        randomize_group_list(&groups[g]);
+    }
+
     *arena_ptr = arena;
     *num_pages_ptr = num_pages;
-    
     return groups;
 }
 
 
 group_t* merge_groups_create_new(group_t *orig, int num_groups) {
-
     if (num_groups <= 0 || num_groups > 64 || (64 % num_groups) != 0) {
         fprintf(stderr, "num_groups must divide 64\n");
         return NULL;
     }
 
     int block = 64 / num_groups;
-
-    // Allocate NEW groups struct
     group_t *merged = calloc(num_groups, sizeof(group_t));
     if (!merged) {
         perror("calloc merged groups");
         return NULL;
     }
 
+    // Initialize merged groups
+    for (int ng = 0; ng < num_groups; ng++) {
+        merged[ng].head = NULL;
+        merged[ng].tail = NULL;
+        merged[ng].count = 0;
+    }
+
     // Build merged groups
     for (int ng = 0; ng < num_groups; ng++) {
-
-        // Count total number of addresses for this merged group
-        size_t total = 0;
         int start = ng * block;
-        int end   = (ng + 1) * block;
+        int end = (ng + 1) * block;
 
-        for (int og = start; og < end; og++)
-            total += orig[og].count;
-
-        // Allocate new pointer array
-        merged[ng].addrs = malloc(total * sizeof(uint8_t *));
-        if (!merged[ng].addrs) {
-            perror("malloc merged addrs");
-            // Caller will free partially created merged[] using existing cleanup
-            return merged;
-        }
-
-        merged[ng].cap   = total;
-        merged[ng].count = 0;
-
-        // Copy pointers from old groups into new group
+        // Copy all nodes from original groups to merged group
         for (int og = start; og < end; og++) {
-            memcpy(&merged[ng].addrs[merged[ng].count],
-                   orig[og].addrs,
-                   orig[og].count * sizeof(uint8_t *));
-
-            merged[ng].count += orig[og].count;
+            addr_node_t *current = orig[og].head;
+            while (current != NULL) {
+                // Create new node
+                addr_node_t *new_node = malloc(sizeof(addr_node_t));
+                if (!new_node) {
+                    perror("malloc merged node");
+                    cleanup_merged_groups(merged, num_groups);
+                    return NULL;
+                }
+                
+                new_node->addr = current->addr;
+                new_node->next = NULL;
+                
+                // Add to merged group
+                if (merged[ng].head == NULL) {
+                    merged[ng].head = new_node;
+                    merged[ng].tail = new_node;
+                } else {
+                    merged[ng].tail->next = new_node;
+                    merged[ng].tail = new_node;
+                }
+                merged[ng].count++;
+                
+                current = current->next;
+            }
         }
+
+        // Randomize the merged group
+        randomize_group_list(&merged[ng]);
     }
 
     return merged;
@@ -140,7 +179,12 @@ group_t* merge_groups_create_new(group_t *orig, int num_groups) {
 void cleanup_groups(group_t *groups, void *arena) {
     if (groups) {
         for (int g = 0; g < MAX_NUM_GROUPS; g++) {
-            free(groups[g].addrs);
+            addr_node_t *current = groups[g].head;
+            while (current != NULL) {
+                addr_node_t *next = current->next;
+                free(current);
+                current = next;
+            }
         }
         free(groups);
     }
@@ -149,12 +193,50 @@ void cleanup_groups(group_t *groups, void *arena) {
     }
 }
 
+
 void cleanup_merged_groups(group_t *groups, int num_groups) {
     if (groups) {
-        for (int g = 0; g < num_groups; g++) {  // Use actual count, not MAX_NUM_GROUPS
-            free(groups[g].addrs);
+        for (int g = 0; g < num_groups; g++) {
+            addr_node_t *current = groups[g].head;
+            while (current != NULL) {
+                addr_node_t *next = current->next;
+                free(current);
+                current = next;
+            }
         }
         free(groups);
     }
 }
 
+// Convert linked list to randomized order
+void randomize_group_list(group_t *group) {
+    if (group->count == 0) return;
+
+    // Create temporary array with all addresses
+    uint8_t **temp_array = malloc(group->count * sizeof(uint8_t *));
+    if (!temp_array) {
+        fprintf(stderr, "Failed to allocate temporary array for randomization\n");
+        return;
+    }
+
+    // Extract addresses from linked list
+    addr_node_t *current = group->head;
+    size_t index = 0;
+    while (current != NULL) {
+        temp_array[index++] = current->addr;
+        current = current->next;
+    }
+
+    // Shuffle the array
+    shuffle_array(temp_array, group->count);
+
+    // Rebuild the linked list with shuffled order
+    current = group->head;
+    index = 0;
+    while (current != NULL) {
+        current->addr = temp_array[index++];
+        current = current->next;
+    }
+
+    free(temp_array);
+}
