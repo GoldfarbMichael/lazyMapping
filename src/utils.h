@@ -7,7 +7,6 @@
 
 #define MAX_NUM_GROUPS 64
 #define LINE_SIZE 64
-#define DEFAULT_ARENA_MB 48
 #define CLCOCK_SPEED 3.1e9 // 3.1 GHz
 
 // Linked list node for addresses

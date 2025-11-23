@@ -22,3 +22,7 @@ Thumbs.db
 # Temporary files
 *~
 *.tmp
+
+Mastik-main/
+
+analysis/heatmaps/

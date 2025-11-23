@@ -44,7 +44,7 @@ group_t* initialize_groups(size_t arena_mb, void **arena_ptr, size_t *num_pages_
     size_t arena_size = arena_mb * MB;
 
     // Seed random number generator
-    srand(time(42));
+    srand(42);
 
     void *arena = NULL;
     if (posix_memalign(&arena, PAGE_SIZE, arena_size) != 0) {

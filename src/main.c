@@ -9,6 +9,7 @@
 #include "utils.h"
 
 #define OLD_EXPERIMENT 0
+#define DEFAULT_ARENA_MB 12
 
 void old_experiment(l3pp_t l3, group_t *groups, experiment_config_t *experiments, int num_experiments) {
     uint16_t* res = (uint16_t*) calloc(l3_getSets(l3), sizeof(uint16_t));
@@ -128,7 +129,7 @@ void new_experiment(l3pp_t l3, group_t *groups, experiment_config_t *experiments
 
         // Run the experiment
         for(int g = 0; g < config->num_groups; g++){
-            for(int iter = 0; iter < 2; iter++){
+            for(int iter = 0; iter < 30; iter++){
                 printf("Group %d, Iteration %d\n", g, iter);
                 for(int set = 0; set < l3_getSets(l3); set++){
                     l3_unmonitorall(l3);
@@ -202,6 +203,10 @@ int main(int argc, char **argv) {
     {"1_group_no_prime1", 1, 0},
     {"1_group_prime", 1, 1},
     {"2_group_prime", 2, 1},
+    {"4_group_prime", 4, 1},
+    {"8_group_prime", 8, 1},
+    {"16_group_prime", 16, 1},
+    {"32_group_prime", 32, 1},
     {"64_group_prime", 64, 1}
     };
     int num_experiments = sizeof(experiments) / sizeof(experiments[0]);
