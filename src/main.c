@@ -9,9 +9,10 @@
 #include "utils.h"
 
 #define OLD_EXPERIMENT 0
-#define DEFAULT_ARENA_MB 12
+#define DEFAULT_ARENA_MB 48
+#define OUTPUT_BASE_DIR "data"
 
-void old_experiment(l3pp_t l3, group_t *groups, experiment_config_t *experiments, int num_experiments) {
+void old_experiment(l3pp_t l3, group_t *groups, experiment_config_t *experiments, int num_experiments, const char *output_dir) {
     uint16_t* res = (uint16_t*) calloc(l3_getSets(l3), sizeof(uint16_t));
     
     // monitor all sets 
@@ -38,8 +39,8 @@ void old_experiment(l3pp_t l3, group_t *groups, experiment_config_t *experiments
         }
 
         // Create log file
-        char filename[256];
-        snprintf(filename, sizeof(filename), "%s.jsonl", config->name);
+        char filename[512];
+        snprintf(filename, sizeof(filename), "%s/%s.jsonl", output_dir, config->name);
         FILE *log = fopen(filename, "w");
         
         if (!log) {
@@ -96,7 +97,7 @@ void old_experiment(l3pp_t l3, group_t *groups, experiment_config_t *experiments
  *  res is size of 1 
  *  finalRes is size of l3_getSets(l3) 
  */
-void new_experiment(l3pp_t l3, group_t *groups, experiment_config_t *experiments, int num_experiments) {
+void new_experiment(l3pp_t l3, group_t *groups, experiment_config_t *experiments, int num_experiments, const char *output_dir) {
     uint16_t* res = (uint16_t*) calloc(1, sizeof(uint16_t));
     uint16_t* finalRes = (uint16_t*) calloc(l3_getSets(l3), sizeof(uint16_t));
     
@@ -116,9 +117,9 @@ void new_experiment(l3pp_t l3, group_t *groups, experiment_config_t *experiments
             continue;
         }
 
-        // Create log file
-        char filename[256];
-        snprintf(filename, sizeof(filename), "%s.jsonl", config->name);
+        // Create log file with directory structure
+        char filename[512];
+        snprintf(filename, sizeof(filename), "%s/%s.jsonl", output_dir, config->name);
         FILE *log = fopen(filename, "w");
         
         if (!log) {
@@ -174,7 +175,12 @@ void new_experiment(l3pp_t l3, group_t *groups, experiment_config_t *experiments
 
 
 
-
+// Add function definition before main()
+int create_output_directory(const char *path) {
+    char command[1024];
+    snprintf(command, sizeof(command), "mkdir -p %s", path);
+    return system(command);
+}
 
 int main(int argc, char **argv) {
 
@@ -187,6 +193,17 @@ int main(int argc, char **argv) {
             return 1;
         }
     }
+    // Create output directory path
+    char output_dir[256];
+    snprintf(output_dir, sizeof(output_dir), "%s/%zuMB", OUTPUT_BASE_DIR, arena_mb);
+    
+    // Create the directory
+    if (create_output_directory(output_dir) != 0) {
+        fprintf(stderr, "Failed to create output directory: %s\n", output_dir);
+        return 1;
+    }
+    
+    printf("Output directory: %s\n", output_dir);
 
     l3pp_t l3;
     prepareL3(&l3);
@@ -217,10 +234,10 @@ int main(int argc, char **argv) {
 
 
     if (OLD_EXPERIMENT == 1) {
-        old_experiment(l3, groups, experiments, num_experiments);
+        old_experiment(l3, groups, experiments, num_experiments, output_dir);
     } else {
         // Future: new experiment code goes here
-        new_experiment(l3, groups, experiments, num_experiments);
+        new_experiment(l3, groups, experiments, num_experiments, output_dir);
     }
 
 

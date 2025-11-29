@@ -24,5 +24,6 @@ Thumbs.db
 *.tmp
 
 Mastik-main/
+Mastik-main/mastik/l3.h
 
 analysis/heatmaps/
