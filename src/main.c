@@ -5,12 +5,20 @@
 #include <stdint.h>
 #include <string.h>
 #include <errno.h>
+#include <unistd.h>      // for pipe, fork, close, read, write
+#include <sys/wait.h>    // for wait
+#include <sys/types.h>   // for pid_t
+#include <sys/mman.h>     // for shared memory
+#include <semaphore.h>    // for semaphores
+#include <fcntl.h>        // for O_* constants
 #include <mastik/l3.h>
 #include "utils.h"
 
+#define PRIME_BY_GROUP_LINE 1
 #define OLD_EXPERIMENT 0
-#define DEFAULT_ARENA_MB 48
-#define OUTPUT_BASE_DIR "data"
+#define MISSES_EXPERIMENT 0
+#define DEFAULT_ARENA_MB 12
+#define OUTPUT_BASE_DIR "data/lfence"
 
 void old_experiment(l3pp_t l3, group_t *groups, experiment_config_t *experiments, int num_experiments, const char *output_dir) {
     uint16_t* res = (uint16_t*) calloc(l3_getSets(l3), sizeof(uint16_t));
@@ -54,19 +62,24 @@ void old_experiment(l3pp_t l3, group_t *groups, experiment_config_t *experiments
             for(int iter = 0; iter < 30; iter++){
                 printf("Group %d, Iteration %d\n", g, iter);
                 l3_bprobecount(l3, res);
+                __asm__ volatile("lfence" ::: "memory");
 
-                __asm__ volatile("mfence" ::: "memory");
+                // __asm__ volatile("mfence" ::: "memory");
 
                 // Prime only if enabled
                 if (config->prime_enabled) {
                     addr_node_t *current = exp_groups[g].head;
-                    while (current != NULL) {
+                    while (current != NULL && current->next != NULL) {
+                        maccessMy(current->next->addr);
+                        maccessMy(current->addr);
+                        maccessMy(current->next->addr);
                         maccessMy(current->addr);
                         current = current->next;
                     }
                 }
+                __asm__ volatile("lfence" ::: "memory");
 
-                __asm__ volatile("mfence" ::: "memory");
+                // __asm__ volatile("mfence" ::: "memory");
                 l3_probecount(l3, res);
 
                 // Write to JSONL log
@@ -91,12 +104,62 @@ void old_experiment(l3pp_t l3, group_t *groups, experiment_config_t *experiments
 }
 
 
-/**
- *  New experiment function template
- *  here we probe one set at a time 
- *  res is size of 1 
- *  finalRes is size of l3_getSets(l3) 
- */
+void only_misses_exp(l3pp_t l3, l3pp_t l3_primer, const char *output_dir) {
+    uint16_t* res = (uint16_t*) calloc(1, sizeof(uint16_t));
+    uint16_t* primer_res = (uint16_t*) calloc(l3_getSlices(l3_primer)*2, sizeof(uint16_t));
+    // uint16_t* primer_res = (uint16_t*) calloc(l3_getSets(l3_primer), sizeof(uint16_t));
+    
+    uint16_t* finalRes = (uint16_t*) calloc(l3_getSets(l3), sizeof(uint16_t));
+    
+    // l3_unmonitorall(l3_primer);
+    // for(int set = 0; set < l3_getSets(l3); set++){
+    // l3_monitor(l3_primer, set);
+    // }
+
+    for(int set = 0; set < l3_getSets(l3); set++){
+        l3_unmonitorall(l3);
+        l3_unmonitorall(l3_primer);
+        
+        l3_monitor(l3, set); 
+        for(int slice = 0; slice < l3_getSlices(l3_primer);slice++){
+        l3_monitor(l3_primer, set*slice);
+        }
+        
+        l3_bprobecount(l3, res);
+        __asm__ volatile("lfence" ::: "memory");
+        l3_repeatedprobecount(l3_primer, 2,primer_res, 3000);  // primer probe to evict from cache
+        __asm__ volatile("lfence" ::: "memory");
+        l3_probecount(l3, res);
+        finalRes[set] = res[0];
+    }
+    // Write to JSONL log
+    char filename[512];
+    snprintf(filename, sizeof(filename), "%s/misses.jsonl", output_dir);
+    FILE *log = fopen(filename, "w");
+    
+    if (!log) {
+        fprintf(stderr, "Failed to open log file %s\n", filename);
+        free(finalRes);
+        free(res);  
+        return;
+    }
+    fprintf(log, "{\"group\":0,\"iter\":0,\"probe_counts\":[");
+    for (int set = 0; set < l3_getSets(l3); set++) {
+        fprintf(log, "%u", finalRes[set]);
+        if (set < l3_getSets(l3) - 1) {
+            fprintf(log, ",");
+        }
+    }
+    fprintf(log, "]}\n");
+    fclose(log);
+    free(finalRes);
+    free(res);
+}
+
+
+
+
+
 void new_experiment(l3pp_t l3, group_t *groups, experiment_config_t *experiments, int num_experiments, const char *output_dir) {
     uint16_t* res = (uint16_t*) calloc(1, sizeof(uint16_t));
     uint16_t* finalRes = (uint16_t*) calloc(l3_getSets(l3), sizeof(uint16_t));
@@ -174,6 +237,97 @@ void new_experiment(l3pp_t l3, group_t *groups, experiment_config_t *experiments
 }
 
 
+void prime_by_group_line(l3pp_t l3, group_t *groups, experiment_config_t *experiments, int num_experiments, const char *output_dir) {
+    uint16_t* res = (uint16_t*) calloc(1, sizeof(uint16_t));
+    uint16_t* finalRes = (uint16_t*) calloc(l3_getSets(l3), sizeof(uint16_t));
+    uint16_t* whatToClear = (uint16_t*) calloc(l3_getSets(l3), sizeof(uint16_t));
+    int clearCounter = 0;
+
+    
+
+    // Run each experiment
+    for (int exp = 0; exp < num_experiments; exp++) {
+        experiment_config_t *config = &experiments[exp];
+        
+        printf("Running experiment: %s (groups: %d, prime: %s)\n", 
+               config->name, config->num_groups, 
+               config->prime_enabled ? "yes" : "no");
+
+        // Create merged groups for this experiment
+        group_t *exp_groups = merge_groups_create_new(groups, config->num_groups);
+        if (!exp_groups) {
+            printf("merge failed for %s\n", config->name);
+            continue;
+        }
+
+        // Create log file with directory structure
+        char filename[512];
+        snprintf(filename, sizeof(filename), "%s/%s.jsonl", output_dir, config->name);
+        FILE *log = fopen(filename, "w");
+        
+        if (!log) {
+            fprintf(stderr, "Failed to open log file %s\n", filename);
+            cleanup_merged_groups(exp_groups, config->num_groups);
+            continue;
+        }
+
+        // Run the experiment
+        for(int g = 0; g < config->num_groups; g++){
+            for(int iter = 0; iter < 30; iter++){
+                printf("Group %d, Iteration %d\n", g, iter);
+                addr_node_t *current = exp_groups[g].head;
+                int lineCount = 0;
+                while (current != NULL)
+                {                
+                    for(int set = 0; set < l3_getSets(l3); set++){
+                        l3_unmonitorall(l3);
+                        l3_monitor(l3, set);
+                        l3_bprobecount(l3, res);
+
+                        __asm__ volatile("mfence" ::: "memory"); 
+                           
+                        maccessMy(current->addr);
+                        
+                        __asm__ volatile("mfence" ::: "memory");
+                        l3_probecount(l3, res);
+                        finalRes[set] = res[0];
+                        if(res[0] > 0){
+                            whatToClear[clearCounter] = set;
+                            clearCounter++;
+                        }
+                    }
+
+                    // Write to JSONL log + clear recorded sets
+                    fprintf(log, "{\"group\":%d,\"iter\":%d,\"groupLine\":%d,\"missed_sets\":[", g, iter, lineCount);
+                    int clearIndex = 0;
+                    while(clearIndex < clearCounter){
+                        fprintf(log, "[%u,%u]",whatToClear[clearIndex], finalRes[whatToClear[clearIndex]]); //format --> [setIndex, numOfMisses]
+                        if (clearIndex < clearCounter - 1) {
+                            fprintf(log, ",");
+                        }
+                        finalRes[whatToClear[clearIndex]] = 0;
+                        whatToClear[clearIndex] = 0;
+                        clearIndex++;
+                    }
+                    fprintf(log, "]}\n");
+                    fflush(log);
+
+                    clearCounter = 0;
+                    current = current->next;
+                    lineCount++;
+                }
+            }
+        }
+
+        fclose(log);
+        cleanup_merged_groups(exp_groups, config->num_groups);
+        printf("Completed experiment: %s\n", config->name);
+    }
+    free(whatToClear);
+    free(finalRes);
+    free(res);
+}
+
 
 // Add function definition before main()
 int create_output_directory(const char *path) {
@@ -205,19 +359,29 @@ int main(int argc, char **argv) {
     
     printf("Output directory: %s\n", output_dir);
 
+
+
     l3pp_t l3;
     prepareL3(&l3);
     void *arena;
     size_t num_pages;
     group_t *groups = initialize_groups(arena_mb, &arena, &num_pages); 
     
+    if( MISSES_EXPERIMENT == 1) {
+        l3pp_t l3_primer;
+        prepareL3(&l3_primer);
+        only_misses_exp(l3, l3_primer, "data");
+        l3_release(l3_primer);
+        return 0;
+    } 
+
     if (!groups) {
         return 1;  // Error already printed
     }
 
     experiment_config_t experiments[] = {
-    {"1_group_no_prime0", 1, 0},
-    {"1_group_no_prime1", 1, 0},
+    // {"1_group_no_prime0", 1, 0},
+    // {"1_group_no_prime1", 1, 0},
     {"1_group_prime", 1, 1},
     {"2_group_prime", 2, 1},
     {"4_group_prime", 4, 1},
@@ -232,12 +396,15 @@ int main(int argc, char **argv) {
 
     //------------------ END OF INITIALIZATION ------------------//
 
+    if (PRIME_BY_GROUP_LINE == 1) {
+        prime_by_group_line(l3, groups, experiments, num_experiments, "data/prime_by_group_line");
+    } else
 
     if (OLD_EXPERIMENT == 1) {
         old_experiment(l3, groups, experiments, num_experiments, output_dir);
     } else {
         // Future: new experiment code goes here
-        new_experiment(l3, groups, experiments, num_experiments, output_dir);
+        new_experiment(l3, groups, experiments, num_experiments, "data");
     }
 
 
