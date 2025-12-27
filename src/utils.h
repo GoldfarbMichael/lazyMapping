@@ -8,6 +8,8 @@
 #define MAX_NUM_GROUPS 64
 #define LINE_SIZE 64
 #define CLCOCK_SPEED 3.1e9 // 3.1 GHz
+#define NUM_ITERATIONS 30
+#define EXPECTED_NUM_SETS 16384
 
 // Linked list node for addresses
 typedef struct addr_node {
@@ -29,6 +31,11 @@ typedef struct {
     int prime_enabled;
 } experiment_config_t;
 
+typedef struct {
+    int set_index;
+    uint16_t min_value;
+} set_min_pair_t;
+
 static inline void maccessMy(void *p) {
     __asm__ volatile("movb (%0), %%al" : : "r"(p) : "eax", "memory");
 }
@@ -41,5 +48,5 @@ void cleanup_groups(group_t *groups, void *arena);
 void cleanup_merged_groups(group_t *groups, int num_groups);
 void randomize_group_list(group_t *group);
 void shuffle_array(uint8_t **array, size_t n);
-
+set_min_pair_t* get_min_values(uint16_t** res_mat, int num_sets, int* out_count);
 #endif

@@ -14,11 +14,12 @@
 #include <mastik/l3.h>
 #include "utils.h"
 
-#define PRIME_BY_GROUP_LINE 1
+#define PRIME_BY_GROUP_LINE 0
 #define OLD_EXPERIMENT 0
 #define MISSES_EXPERIMENT 0
-#define DEFAULT_ARENA_MB 12
+#define DEFAULT_ARENA_MB 24
 #define OUTPUT_BASE_DIR "data/lfence"
+
 
 void old_experiment(l3pp_t l3, group_t *groups, experiment_config_t *experiments, int num_experiments, const char *output_dir) {
     uint16_t* res = (uint16_t*) calloc(l3_getSets(l3), sizeof(uint16_t));
@@ -239,9 +240,30 @@ void new_experiment(l3pp_t l3, group_t *groups, experiment_config_t *experiments
 
 void prime_by_group_line(l3pp_t l3, group_t *groups, experiment_config_t *experiments, int num_experiments, const char *output_dir) {
     uint16_t* res = (uint16_t*) calloc(1, sizeof(uint16_t));
-    uint16_t* finalRes = (uint16_t*) calloc(l3_getSets(l3), sizeof(uint16_t));
-    uint16_t* whatToClear = (uint16_t*) calloc(l3_getSets(l3), sizeof(uint16_t));
-    int clearCounter = 0;
+    // Allocate array of pointers for NUM_ITERATIONS
+    uint16_t** finalRes = (uint16_t**) calloc(NUM_ITERATIONS, sizeof(uint16_t*));
+    if (!finalRes) {
+        fprintf(stderr, "Failed to allocate finalRes array\n");
+        free(res);
+        free(finalRes);
+        return;
+    }
+    
+    // Allocate each array inside
+    for (int i = 0; i < NUM_ITERATIONS; i++) {
+        finalRes[i] = (uint16_t*) calloc(l3_getSets(l3), sizeof(uint16_t));
+        if (!finalRes[i]) {
+            fprintf(stderr, "Failed to allocate finalRes[%d]\n", i);
+            // Free previously allocated arrays
+            for (int j = 0; j < i; j++) {
+                free(finalRes[j]);
+            }
+            free(res);
+            free(finalRes);
+            return;
+        }
+    }
+
 
     
 
@@ -271,14 +293,19 @@ void prime_by_group_line(l3pp_t l3, group_t *groups, experiment_config_t *experi
             continue;
         }
 
+        // uint64_t start_cycles, end_cycles;
         // Run the experiment
         for(int g = 0; g < config->num_groups; g++){
-            for(int iter = 0; iter < 30; iter++){
-                printf("Group %d, Iteration %d\n", g, iter);
-                addr_node_t *current = exp_groups[g].head;
-                int lineCount = 0;
-                while (current != NULL)
-                {                
+
+            addr_node_t *current = exp_groups[g].head;
+            int lineCount = 0;
+            while (current != NULL)
+            { 
+                printf("Group %d, groupLine: %d\n", g, lineCount);        
+                // start_cycles = rdtscp64();
+       
+                for(int iter = 0; iter < NUM_ITERATIONS; iter++){
+
                     for(int set = 0; set < l3_getSets(l3); set++){
                         l3_unmonitorall(l3);
                         l3_monitor(l3, set);
@@ -290,32 +317,33 @@ void prime_by_group_line(l3pp_t l3, group_t *groups, experiment_config_t *experi
                         
                         __asm__ volatile("mfence" ::: "memory");
                         l3_probecount(l3, res);
-                        finalRes[set] = res[0];
-                        if(res[0] > 0){
-                            whatToClear[clearCounter] = set;
-                            clearCounter++;
-                        }
+                        finalRes[iter][set] = res[0];
                     }
+                }
+                int num_nonzero;
+                set_min_pair_t* min_values = get_min_values(finalRes, l3_getSets(l3), &num_nonzero);
 
-                    // Write to JSONL log + clear recorded sets
-                    fprintf(log, "{\"group\":%d,\"iter\":%d,\"groupLine\":%d,\"missed_sets\":[", g, iter, lineCount);
-                    int clearIndex = 0;
-                    while(clearIndex < clearCounter){
-                        fprintf(log, "[%u,%u]",whatToClear[clearIndex], finalRes[whatToClear[clearIndex]]); //format --> [setIndex, numOfMisses]
-                        if (clearIndex < clearCounter - 1) {
+                // Write to JSONL log
+                fprintf(log, "{\"group\":%d,\"groupLine\":%d,\"missed_sets\":[", g, lineCount);
+
+                if (min_values) {
+                    for (int i = 0; i < num_nonzero; i++) {
+                        fprintf(log, "[%d,%u]", min_values[i].set_index, min_values[i].min_value);
+                        if (i < num_nonzero - 1) {
                             fprintf(log, ",");
                         }
-                        finalRes[whatToClear[clearIndex]] = 0;
-                        whatToClear[clearIndex] = 0;
-                        clearIndex++;
                     }
-                    fprintf(log, "]}\n");
-                    fflush(log);
-
-                    clearCounter = 0;
-                    current = current->next;
-                    lineCount++;
+                    free(min_values);
                 }
+
+                fprintf(log, "]}\n");
+                fflush(log);
+
+                current = current->next;
+                lineCount++;
+                // end_cycles = rdtscp64();
+                // double time_cycles = (double)((end_cycles - start_cycles)/CLCOCK_SPEED)*1e3; // in ms
+                // printf("group %d, groupLine %d took: %.3f ms\n", g, lineCount, time_cycles);
             }
         }
 
@@ -323,7 +351,6 @@ void prime_by_group_line(l3pp_t l3, group_t *groups, experiment_config_t *experi
         cleanup_merged_groups(exp_groups, config->num_groups);
         printf("Completed experiment: %s\n", config->name);
     }
-    free(whatToClear);
     free(finalRes);
     free(res);
 }
@@ -397,14 +424,14 @@ int main(int argc, char **argv) {
     //------------------ END OF INITIALIZATION ------------------//
 
     if (PRIME_BY_GROUP_LINE == 1) {
-        prime_by_group_line(l3, groups, experiments, num_experiments, "data/prime_by_group_line");
+        prime_by_group_line(l3, groups, experiments, num_experiments, "data/regular_pages");
     } else
 
     if (OLD_EXPERIMENT == 1) {
         old_experiment(l3, groups, experiments, num_experiments, output_dir);
     } else {
         // Future: new experiment code goes here
-        new_experiment(l3, groups, experiments, num_experiments, "data");
+        new_experiment(l3, groups, experiments, num_experiments, "data/regular_pages/24MB");
     }
 
 

@@ -21,20 +21,50 @@ void shuffle_array(uint8_t **array, size_t n) {
 
 
 void prepareL3(l3pp_t *l3) {
-     l3info_t l3i = (l3info_t)malloc(sizeof(struct l3info));
-     uint64_t start_cycles, end_cycles;
+    l3info_t l3i = (l3info_t)malloc(sizeof(struct l3info));
+    if (!l3i) {
+        fprintf(stderr, "Failed to allocate l3info\n");
+        return;
+    }
+    
+    uint64_t start_cycles = 0;
+    uint64_t end_cycles = 0;
 
-    printf("Preparing \n");
+    // Free any existing L3 instance before the loop
+    if (*l3) {
+        l3_release(*l3);
+        *l3 = NULL;
+    }
+
     start_cycles = rdtscp64();
-    *l3 = l3_prepare(l3i, NULL);
+    
+    while (!(*l3) || l3_getSets(*l3) != EXPECTED_NUM_SETS) {
+        printf("Preparing L3...\n");
+        
+        // Release previous attempt if it exists
+        if (*l3) {
+            l3_release(*l3);
+            *l3 = NULL;
+        }
+        
+        *l3 = l3_prepare(l3i, NULL);
+        
+        if (!(*l3)) {
+            fprintf(stderr, "l3_prepare failed\n");
+            break;
+        }
+    }
+    
     end_cycles = rdtscp64();
-
-    double time_cycles = (double)((end_cycles - start_cycles)/CLCOCK_SPEED)*1e3; // in ms
+    
+    double time_cycles = (double)((end_cycles - start_cycles) / CLCOCK_SPEED) * 1e3; // in ms
     printf("L3 preparation took VIA CYCLES: %.3f ms\n", time_cycles);
 
-    printf("L3 Cache Sets: %d\n", l3_getSets(*l3));
-    printf("L3 Cache Slices: %d\n", l3_getSlices(*l3));
-    printf("L3 Cache num of lines: %d\n", l3_getAssociativity(*l3));
+    if (*l3) {
+        printf("L3 Cache Sets: %d\n", l3_getSets(*l3));
+        printf("L3 Cache Slices: %d\n", l3_getSlices(*l3));
+        printf("L3 Cache num of lines: %d\n", l3_getAssociativity(*l3));
+    }
 
     free(l3i);
 }
@@ -239,4 +269,78 @@ void randomize_group_list(group_t *group) {
     }
 
     free(temp_array);
+}
+
+
+
+
+
+/**
+ * Gets minimum values for each set across all iterations
+ * Returns array of [set_index, min_value] pairs for non-zero minimums
+ * 
+ * @param res_mat: Matrix of [NUM_ITERATIONS][num_sets]
+ * @param num_sets: Number of sets (columns in matrix)
+ * @param out_count: Output parameter - number of non-zero minimums found
+ * @return: Array of set_min_pair_t containing only non-zero minimums
+ */
+set_min_pair_t* get_min_values(uint16_t** res_mat, int num_sets, int* out_count) {
+    int x = 0; //x = num of nonzero values in tempArr
+    // 1) init tempArr[numOfSets]
+    uint16_t* tempArr = (uint16_t*) calloc(num_sets, sizeof(uint16_t));
+    if (!tempArr) {
+        fprintf(stderr, "Failed to allocate tempArr\n");
+        *out_count = 0;
+        return NULL;
+    }
+    
+    // Initialize with maximum values
+    for (int s = 0; s < num_sets; s++) {
+        tempArr[s] = UINT16_MAX;
+    }
+    
+    // 2) for each set s in res_mat
+    for (int s = 0; s < num_sets; s++) {
+        // 2.1) find min value across all iterations
+        uint16_t min_val = UINT16_MAX;
+        for (int iter = 0; iter < NUM_ITERATIONS; iter++) {
+            if (res_mat[iter][s] < min_val) {
+                min_val = res_mat[iter][s];
+            }
+            res_mat[iter][s] = 0; // reset to 0 for the next group
+        }
+        // 2.2) insert to tempArr to corresponding index
+        tempArr[s] = min_val;
+        if (min_val > 0 && min_val != UINT16_MAX) {
+            x++;
+        }
+    }
+    
+
+    // 4) init retarray[x]
+    set_min_pair_t* retArr = (set_min_pair_t*) calloc(x, sizeof(set_min_pair_t));
+    if (!retArr) {
+        fprintf(stderr, "Failed to allocate retArr\n");
+        free(tempArr);
+        *out_count = 0;
+        return NULL;
+    }
+    
+    // 5) for i in range 0...tempArr(len)
+    int ret_index = 0;
+    for (int i = 0; i < num_sets; i++) {
+        // 5.1) if (tempArr[i] > 0)
+        if (tempArr[i] > 0 && tempArr[i] != UINT16_MAX) {
+            // 5.1.2) retArr[i] = [i, tempArr[i]]
+            retArr[ret_index].set_index = i;
+            retArr[ret_index].min_value = tempArr[i];
+            ret_index++;
+        }
+    }
+    
+    free(tempArr);
+    *out_count = x;
+    
+    // 6) return retArr
+    return retArr;
 }
