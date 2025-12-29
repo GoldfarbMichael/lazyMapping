@@ -69,6 +69,97 @@ void prepareL3(l3pp_t *l3) {
     free(l3i);
 }
 
+// -----------128B stride version for 64 groups--------------
+
+// group_t* initialize_groups(size_t arena_mb, void **arena_ptr, size_t *num_pages_ptr) {
+//     const size_t MB = 1024 * 1024;
+//     size_t arena_size = 2 * arena_mb * MB;
+
+//     // Seed random number generator
+//     srand(42);
+
+//     void *arena = NULL;
+//     if (posix_memalign(&arena, PAGE_SIZE, arena_size) != 0) {
+//         perror("posix_memalign");
+//         return NULL;
+//     }
+//     memset(arena, 0, arena_size);
+
+//     size_t num_pages = arena_size / PAGE_SIZE;
+//     // We process memory in "Double Pages" (8KB chunks).
+//     // An 8KB chunk perfectly fits 64 groups * 128 bytes (Data + Padding).
+//     size_t num_double_pages = num_pages / 2;
+
+//     printf("Arena: %zu MiB (Effective), Allocated: %zu MiB\n", arena_mb, arena_size / MB);
+//     printf("Total Pages: %zu, Double-Page Blocks: %zu, Groups: %d\n",
+//            num_pages, num_double_pages, MAX_NUM_GROUPS);
+
+//     group_t *groups = malloc(MAX_NUM_GROUPS * sizeof(group_t));
+//     if (!groups) {
+//         fprintf(stderr, "malloc failed for groups array\n");
+//         free(arena);
+//         return NULL;
+//     }
+
+//     // Initialize each group's linked list
+//     for (int g = 0; g < MAX_NUM_GROUPS; g++) {
+//         groups[g].head = NULL;
+//         groups[g].tail = NULL;
+//         groups[g].count = 0;
+//     }
+
+//     // Build groups iterating over 8KB chunks (Double Pages)
+//     for (size_t dp = 0; dp < num_double_pages; dp++) {
+//         // Calculate the base address of this 8KB chunk
+//         // dp * 2 * PAGE_SIZE ensures we step 8KB forward each iteration
+//         uint8_t *chunk_base = (uint8_t *)arena + (dp * 2 * PAGE_SIZE);
+
+
+//         for (int g = 0; g < MAX_NUM_GROUPS; g++) {
+//             // We use a 128-byte stride (2 * LINE_SIZE) instead of 64 bytes.
+//             // Layout: [Group G Data (64B)] [Padding/Garbage (64B)] [Group G+1 Data (64B)] ...
+//             // The hardware prefetcher will fetch the padding (L2 Adjacent Cache Line Prefetcher).
+//             size_t off = (size_t)g * (LINE_SIZE * 2);
+//             uint8_t *addr = chunk_base + off;
+            
+//             // Create new node
+//             addr_node_t *new_node = malloc(sizeof(addr_node_t));
+//             if (!new_node) {
+//                 fprintf(stderr, "malloc failed for node in group %d\n", g);
+//                 cleanup_groups(groups, arena);
+//                 return NULL;
+//             }
+            
+//             new_node->addr = addr;
+//             new_node->next = NULL;
+            
+//             // Add to linked list (append to tail)
+//             if (groups[g].head == NULL) {
+//                 groups[g].head = new_node;
+//                 groups[g].tail = new_node;
+//             } else {
+//                 groups[g].tail->next = new_node;
+//                 groups[g].tail = new_node;
+//             }
+//             groups[g].count++;
+//         }
+//     }
+
+//     // Randomize each group's linked list
+//     printf("Randomizing group lists...\n");
+//     for (int g = 0; g < MAX_NUM_GROUPS; g++) {
+//         randomize_group_list(&groups[g]);
+//     }
+
+//     *arena_ptr = arena;
+//     *num_pages_ptr = num_pages;
+//     return groups;
+// }
+
+
+
+// -----------64B stride version for 32 groups--------------
+
 group_t* initialize_groups(size_t arena_mb, void **arena_ptr, size_t *num_pages_ptr) {
     const size_t MB = 1024 * 1024;
     size_t arena_size = arena_mb * MB;
@@ -101,37 +192,69 @@ group_t* initialize_groups(size_t arena_mb, void **arena_ptr, size_t *num_pages_
         groups[g].count = 0;
     }
 
-    // Build groups with linked lists
+    // Build groups with "Sector Merging" strategy
     for (size_t p = 0; p < num_pages; p++) {
         uint8_t *page_base = (uint8_t *)arena + p * PAGE_SIZE;
+        
+        // We have 32 Groups. We want to cover the whole 4096 bytes.
+        // Each group must cover 128 bytes (a Sector).
+        // Inside that sector, we grab BOTH 64-byte lines.
         for (int g = 0; g < MAX_NUM_GROUPS; g++) {
-            size_t off = (size_t)g * LINE_SIZE;
-            uint8_t *addr = page_base + off;
             
-            // Create new node
-            addr_node_t *new_node = malloc(sizeof(addr_node_t));
-            if (!new_node) {
-                fprintf(stderr, "malloc failed for node in group %d\n", g);
+            // Calculate the 128-byte Sector Base
+            size_t sector_base = (size_t)g * 128;
+            
+            // --- Line 1 (The "Even" Twin) ---
+            size_t off1 = sector_base; 
+            uint8_t *addr1 = page_base + off1;
+            
+            // --- Line 2 (The "Odd" Twin) ---
+            size_t off2 = sector_base + 64;
+            uint8_t *addr2 = page_base + off2;
+            
+            // Add BOTH to the same group list
+            // This ensures we cover the whole cache (Full Coverage)
+            // And gives us 2x eviction depth per page.
+            
+            // Node 1
+            addr_node_t *node1 = malloc(sizeof(addr_node_t));
+            if (!node1) { 
+                fprintf(stderr, "malloc failed for node1 in group %d\n", g);
                 cleanup_groups(groups, arena);
                 return NULL;
             }
+            node1->addr = addr1;
+            node1->next = NULL;
             
-            new_node->addr = addr;
-            new_node->next = NULL;
-            
-            // Add to linked list (append to tail)
-            if (groups[g].head == NULL) {
-                groups[g].head = new_node;
-                groups[g].tail = new_node;
-            } else {
-                groups[g].tail->next = new_node;
-                groups[g].tail = new_node;
+            if (groups[g].head == NULL) { 
+                groups[g].head = node1;
+                groups[g].tail = node1; 
             }
+            else {
+                groups[g].tail->next = node1; 
+                groups[g].tail = node1; 
+            }
+            groups[g].count++;
+
+            // Node 2
+            addr_node_t *node2 = malloc(sizeof(addr_node_t));
+            if (!node2) { 
+                fprintf(stderr, "malloc failed for node2 in group %d\n", g);
+                cleanup_groups(groups, arena);
+                return NULL;
+             }
+            node2->addr = addr2;
+            node2->next = NULL;
+            
+            groups[g].tail->next = node2;
+            groups[g].tail = node2;
             groups[g].count++;
         }
     }
 
     // Randomize each group's linked list
+    // Crucial: Randomizing mixes the "Odd" and "Even" lines together
+    // so the prefetcher is stressed in a uniform way.
     printf("Randomizing group lists...\n");
     for (int g = 0; g < MAX_NUM_GROUPS; g++) {
         randomize_group_list(&groups[g]);
@@ -142,14 +265,13 @@ group_t* initialize_groups(size_t arena_mb, void **arena_ptr, size_t *num_pages_
     return groups;
 }
 
-
 group_t* merge_groups_create_new(group_t *orig, int num_groups) {
-    if (num_groups <= 0 || num_groups > 64 || (64 % num_groups) != 0) {
-        fprintf(stderr, "num_groups must divide 64\n");
+    if (num_groups <= 0 || num_groups > MAX_NUM_GROUPS || (MAX_NUM_GROUPS % num_groups) != 0) {
+        fprintf(stderr, "num_groups must divide MAX_NUM_GROUPS\n");
         return NULL;
     }
 
-    int block = 64 / num_groups;
+    int block = MAX_NUM_GROUPS / num_groups;
     group_t *merged = calloc(num_groups, sizeof(group_t));
     if (!merged) {
         perror("calloc merged groups");

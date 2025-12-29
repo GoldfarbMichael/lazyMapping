@@ -5,7 +5,7 @@
 #include <stdint.h>
 #include <mastik/l3.h>
 
-#define MAX_NUM_GROUPS 64
+#define MAX_NUM_GROUPS 32 // 64 original we use 32 because of L2 adjacent cache line prefetcher
 #define LINE_SIZE 64
 #define CLCOCK_SPEED 3.1e9 // 3.1 GHz
 #define NUM_ITERATIONS 30

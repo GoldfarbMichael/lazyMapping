@@ -17,7 +17,7 @@
 #define PRIME_BY_GROUP_LINE 0
 #define OLD_EXPERIMENT 0
 #define MISSES_EXPERIMENT 0
-#define DEFAULT_ARENA_MB 24
+#define DEFAULT_ARENA_MB 12
 #define OUTPUT_BASE_DIR "data/lfence"
 
 
@@ -415,7 +415,7 @@ int main(int argc, char **argv) {
     {"8_group_prime", 8, 1},
     {"16_group_prime", 16, 1},
     {"32_group_prime", 32, 1},
-    {"64_group_prime", 64, 1}
+    // {"64_group_prime", 64, 1}
     };
     int num_experiments = sizeof(experiments) / sizeof(experiments[0]);
 
@@ -431,7 +431,7 @@ int main(int argc, char **argv) {
         old_experiment(l3, groups, experiments, num_experiments, output_dir);
     } else {
         // Future: new experiment code goes here
-        new_experiment(l3, groups, experiments, num_experiments, "data/regular_pages/24MB");
+        new_experiment(l3, groups, experiments, num_experiments, "data/64B_stride_L2_prefetcher/12MB");
     }
 
 
