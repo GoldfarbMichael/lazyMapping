@@ -7,6 +7,165 @@
 #include <mastik/impl.h>
 
 
+
+// Offsets derived from Mastik struct l3pp
+#define OFFSET_MONITOREDHEAD 0
+#define OFFSET_NMONITORED    8
+#define OFFSET_MONITOREDSET  16
+
+
+
+void **get_eviction_sets_via_offsets(l3pp_t l3) {
+    if (!l3) return NULL;
+    int total_sets = l3_getSets(l3);
+    // 1. Ensure all sets are being monitored
+    for (int i = 0; i < total_sets; i++)
+    {
+        l3_monitor(l3, i);
+    }
+    
+
+    // 2. Use pointer arithmetic to access the private fields
+    char *base_addr = (char *)l3;
+    
+    // Extract: void **monitoredhead
+    void ***monitoredhead_ptr = (void ***)(base_addr + OFFSET_MONITOREDHEAD);
+    void **internal_heads = *monitoredhead_ptr;
+
+    // Extract: int nmonitored
+    int *nmonitored_ptr = (int *)(base_addr + OFFSET_NMONITORED);
+    int active_count = *nmonitored_ptr;
+    printf("Active monitored sets: %d\n", active_count);
+
+    // Extract: int *monitoredset (The array of actual Set IDs)
+    // While strict sequential monitoring makes this optional, using it makes the code crash-proof.
+    int **monitoredset_ptr = (int **)(base_addr + OFFSET_MONITOREDSET);
+    int *internal_set_ids = *monitoredset_ptr;
+
+    // 3. Allocate the dense array to return
+    // l3_getSets returns the total number of sets (e.g. 2048, 8192)
+    void **dense_array = (void **)calloc(total_sets, sizeof(void *));
+    if (!dense_array) return NULL;
+
+    // 4. Map the internal sparse arrays to our dense array
+    for (int i = 0; i < active_count; i++) {
+        // Get the real Set ID (e.g., 0, 1, 2...)
+        int set_idx = internal_set_ids[i];
+
+        // if(i % 256 == 0) {
+        //     printf("i IS: %d set_idx IS: %d\n", i, set_idx);
+        // }
+        
+        // Safety check
+        if (set_idx >= 0 && set_idx < total_sets) {
+            dense_array[set_idx] = internal_heads[i];
+        }
+    }
+    l3_unmonitorall(l3);
+    return dense_array;
+}
+
+
+
+// Comparator for qsort
+int compare_ptrs(const void *a, const void *b) {
+    const void *ptr_a = *(const void **)a;
+    const void *ptr_b = *(const void **)b;
+    if (ptr_a < ptr_b) return -1;
+    if (ptr_a > ptr_b) return 1;
+    return 0;
+}
+
+// Helper: Flattens all linked lists in 'sets' into a single sorted array of pointers
+// Returns the array, and sets *out_count to the number of elements.
+void **collect_and_sort_addresses(void **sets, int nsets, size_t *out_count) {
+    size_t capacity = 1024;
+    size_t count = 0;
+    void **flat_array = malloc(capacity * sizeof(void *));
+
+    for (int i = 0; i < nsets; i++) {
+        if (sets[i] == NULL) continue;
+
+        void *curr = sets[i];
+        do {
+            // Resize if necessary
+            if (count >= capacity) {
+                capacity *= 2;
+                flat_array = realloc(flat_array, capacity * sizeof(void *));
+            }
+            
+            // Add address
+            flat_array[count++] = curr;
+            
+            // Move to next node
+            curr = LNEXT(curr);
+        } while (curr != sets[i]);
+    }
+
+    // Sort the collected addresses
+    qsort(flat_array, count, sizeof(void *), compare_ptrs);
+    
+    *out_count = count;
+    return flat_array;
+}
+
+/* * Checks if there is any intersection between the addresses in the eviction sets 
+ * of l3_a and l3_b.
+ * Returns: 1 if intersection found, 0 otherwise.
+ * Prints the first 10 intersecting addresses found.
+ */
+int check_intersection(void **sets_a,void **sets_b, int numOfSets) {
+    if (!sets_a || !sets_b) return 0;
+
+    int nsets_a = numOfSets;
+    int nsets_b = numOfSets;
+
+
+    // 2. Flatten and sort
+    size_t count_a, count_b;
+    void **flat_a = collect_and_sort_addresses(sets_a, nsets_a, &count_a);
+    void **flat_b = collect_and_sort_addresses(sets_b, nsets_b, &count_b);
+
+    // 3. Find intersection (linear scan of two sorted arrays)
+    size_t i = 0, j = 0;
+    int found_any = 0;
+    int print_count = 0;
+
+    printf("Checking intersection between %zu addresses (A) and %zu addresses (B)...\n", count_a, count_b);
+
+    while (i < count_a && j < count_b) {
+        if (flat_a[i] < flat_b[j]) {
+            i++;
+        } else if (flat_a[i] > flat_b[j]) {
+            j++;
+        } else {
+            // Match found!
+            found_any = 1;
+            if (print_count < 10) {
+                printf("Intersection found at address: %p\n", flat_a[i]);
+            }
+            print_count++;
+            i++;
+            j++;
+        }
+    }
+
+    if (found_any) {
+        printf("Total intersections found: %d\n", print_count);
+    } else {
+        printf("No intersections found.\n");
+    }
+
+    // 4. Cleanup
+    free(flat_a);
+    free(flat_b);
+
+
+    return found_any;
+}
+
+
+
 // Fisher-Yates shuffle algorithm
 void shuffle_array(uint8_t **array, size_t n) {
     if (n > 1) {
@@ -392,6 +551,98 @@ void randomize_group_list(group_t *group) {
 
     free(temp_array);
 }
+
+
+
+/*
+ * Converts an array of Mastik eviction sets into a group_t array.
+ * Groups are determined by bits 7-11 of the address (merging adjacent lines).
+ * * e_sets: Array of pointers to linked lists (from get_eviction_sets_via_offsets)
+ * num_sets: Size of the e_sets array (e.g., from l3_getSets)
+ */
+group_t* eviction_sets_to_groups(void **e_sets, int num_sets) {
+    if (!e_sets) return NULL;
+
+    // 1. Allocate groups array
+    // We assume MAX_NUM_GROUPS is defined in utils.h (usually 32 or 64)
+    group_t *groups = (group_t *)malloc(MAX_NUM_GROUPS * sizeof(group_t));
+    if (!groups) {
+        perror("malloc groups");
+        return NULL;
+    }
+
+    // Initialize groups
+    for (int g = 0; g < MAX_NUM_GROUPS; g++) {
+        groups[g].head = NULL;
+        groups[g].tail = NULL;
+        groups[g].count = 0;
+    }
+
+    // 2. Iterate through all eviction sets
+    for (int i = 0; i < num_sets; i++) {
+        if (e_sets[i] == NULL) continue;
+
+        void *curr = e_sets[i];
+        
+        // Traverse the circular linked list of the eviction set
+        do {
+            // 3. Calculate Group ID
+            // We want 32 groups max.
+            // Bits 6-11 define the 64 sets in a standard 4KB page view.
+            // To group adjacent lines (Bit 6=0 and Bit 6=1) together, we use Bits 7-11.
+            // Shift right by 7, mask 5 bits (0x1F = 31).
+            uintptr_t addr_val = (uintptr_t)curr;
+            int group_idx = (addr_val >> 7) & 0x1F;
+
+            // Safety check against MAX_NUM_GROUPS
+            if (group_idx < MAX_NUM_GROUPS) {
+                // 4. Create new node for the group
+                addr_node_t *new_node = (addr_node_t *)malloc(sizeof(addr_node_t));
+                if (new_node) {
+                    new_node->addr = curr;
+                    new_node->next = NULL;
+
+                    // Append to group
+                    if (groups[group_idx].head == NULL) {
+                        groups[group_idx].head = new_node;
+                        groups[group_idx].tail = new_node;
+                    } else {
+                        groups[group_idx].tail->next = new_node;
+                        groups[group_idx].tail = new_node;
+                    }
+                    groups[group_idx].count++;
+                }
+            }
+
+            curr = LNEXT(curr); // Move to next in circular list
+        } while (curr != e_sets[i]);
+    }
+
+    // 5. Print final sizes and Randomize
+    printf("Eviction Set Groups Created (Mapping bits 7-11):\n");
+    for (int g = 0; g < MAX_NUM_GROUPS; g++) {
+        // Only print/randomize if the group is relevant (indices 0-31)
+        if (g < 32) {
+            printf("Group %2d: %4zu lines\n", g, groups[g].count);
+            
+            // Randomize to avoid stride patterns during priming
+            if (groups[g].count > 0) {
+                randomize_group_list(&groups[g]);
+            }
+        }
+    }
+
+    return groups;
+}
+
+
+
+
+
+
+
+
+
 
 
 
